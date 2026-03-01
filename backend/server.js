@@ -491,7 +491,7 @@ app.post("/upload", authenticateToken, upload.single("file"), async (req, res) =
     return res.status(403).json({ message: "Dossier non trouvé ou non autorisé" });
   }
 
-  const fileUrl = `http://192.168.151.20:3002/uploads/${req.file.filename}`;
+  const fileUrl = `https://drive-cyan-five.vercel.app:3002/uploads/${req.file.filename}`;
   const fileName = req.file.originalname;
   const fileSize = req.file.size;
 
