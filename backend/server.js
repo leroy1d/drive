@@ -27,12 +27,18 @@ const SALT_ROUNDS = 10;
 // CONNEXION MySQL
 // ============================================
 const db = mysql.createConnection({
-  host: "localhost",
-  user: "root",
-  password: "musk",
-  database: "drive"
+  host: "bcs5gda0htnrrrfyr38k-mysql.services.clever-cloud.com",
+  user: "unefpxhycbw35vpw",
+  password: "skeSCz7C9RJzGNDZko1k",
+  database: "bcs5gda0htnrrrfyr38k",
+  port:3306
 });
-
+// const db = mysql.createConnection({
+//   host: "localhost",
+//   user: "root",
+//   password: "musk",
+//   database: "drive"
+// });
 db.connect(err => {
   if (err) {
     console.error("❌ Erreur connexion MySQL:", err);
