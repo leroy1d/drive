@@ -99,7 +99,7 @@ app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 // 1. INSCRIPTION
 app.post("/auth/register", async (req, res) => {
   const { nom_complet, email, password, pays, telephone, division, activite_id } = req.body;
-
+  console.log("Tentative d'inscription avec:", { nom_complet, email, password, pays, telephone, division, activite_id });
   // Validation des champs obligatoires
   if (!nom_complet || !email || !password || !pays || !telephone || !division) {
     return res.status(400).json({ 
@@ -179,6 +179,7 @@ app.post("/auth/register", async (req, res) => {
 // 2. CONNEXION
 app.post("/auth/login", async (req, res) => {
   const { email, password } = req.body;
+  console.log("Tentative de connexion avec:", { email, password });
 
   if (!email || !password) {
     return res.status(400).json({ 
@@ -484,7 +485,7 @@ app.post("/upload", authenticateToken, upload.single("file"), async (req, res) =
     return res.status(403).json({ message: "Dossier non trouvé ou non autorisé" });
   }
 
-  const fileUrl = `http://192.168.161.20:3002/uploads/${req.file.filename}`;
+  const fileUrl = `http://192.168.151.20:3002/uploads/${req.file.filename}`;
   const fileName = req.file.originalname;
   const fileSize = req.file.size;
 
@@ -724,41 +725,172 @@ app.post("/statistics/submit", authenticateToken, async (req, res) => {
   }
 });
 
-// GET - Récupérer les soumissions de l'utilisateur
-app.get("/statistics/submissions", authenticateToken, async (req, res) => {
-  try {
-    const userId = req.user.id;
-    const page = parseInt(req.query.page) || 1;
-    const limit = parseInt(req.query.limit) || 20;
-    const offset = (page - 1) * limit;
+// Dans server.js, remplacer la route GET /statistics/submissions par :
 
-    const [submissions] = await promiseDb.query(
-      `SELECT SQL_CALC_FOUND_ROWS 
-        id, region, structure, libelle_activite, type_activite,
-        date_activite, lieu_activite, created_at
-       FROM statistics_submissions 
-       WHERE user_id = ? 
-       ORDER BY created_at DESC 
-       LIMIT ? OFFSET ?`,
-      [userId, limit, offset]
-    );
 
-    const [countResult] = await promiseDb.query("SELECT FOUND_ROWS() as total");
+// GET - Récupérer TOUTES les soumissions (pour tout le monde)
+// GET - Récupérer TOUTES les soumissions (pour tout le monde)
+app.get("/statistics/submissions/all", authenticateToken, async (req, res) => {
+    try {
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 10;
+        const offset = (page - 1) * limit;
+        const sortBy = req.query.sortBy || 'created_at';
+        const sortOrder = req.query.sortOrder || 'desc';
+        
+        const { region, structure, type_activite, user_id } = req.query;
 
-    res.json({
-      submissions,
-      pagination: {
-        page,
-        limit,
-        total: countResult[0].total,
-        totalPages: Math.ceil(countResult[0].total / limit)
-      }
-    });
+        let query = `
+            SELECT SQL_CALC_FOUND_ROWS 
+                s.*, 
+                u.nom_complet as nom_prenoms 
+            FROM statistics_submissions s 
+            LEFT JOIN utilisateurs u ON s.user_id = u.id 
+            WHERE 1=1
+        `;
+        const queryParams = [];
 
-  } catch (err) {
-    console.error("❌ Erreur récupération soumissions:", err);
-    res.status(500).json({ message: "Erreur lors de la récupération des soumissions" });
-  }
+        if (region) {
+            query += ' AND s.region = ?';
+            queryParams.push(region);
+        }
+
+        if (structure) {
+            query += ' AND s.structure = ?';
+            queryParams.push(structure);
+        }
+
+        if (type_activite) {
+            query += ' AND s.type_activite = ?';
+            queryParams.push(type_activite);
+        }
+
+        if (user_id) {
+            query += ' AND s.user_id = ?';
+            queryParams.push(user_id);
+        }
+
+        // Tri valide
+        const validSortFields = ['created_at', 'region', 'structure', 'type_activite', 'date_activite'];
+        const sortField = validSortFields.includes(sortBy) ? sortBy : 'created_at';
+        const order = sortOrder === 'asc' ? 'ASC' : 'DESC';
+        
+        query += ` ORDER BY s.${sortField} ${order} LIMIT ? OFFSET ?`;
+        queryParams.push(limit, offset);
+
+        const [submissions] = await promiseDb.query(query, queryParams);
+        const [countResult] = await promiseDb.query("SELECT FOUND_ROWS() as total");
+
+        res.json({
+            submissions,
+            pagination: {
+                page,
+                limit,
+                total: countResult[0].total,
+                totalPages: Math.ceil(countResult[0].total / limit)
+            }
+        });
+
+    } catch (err) {
+        console.error("❌ Erreur récupération soumissions:", err);
+        res.status(500).json({ message: "Erreur lors de la récupération des soumissions" });
+    }
+});
+
+// GET - Récupérer la liste des utilisateurs pour le filtre
+app.get("/statistics/users", authenticateToken, async (req, res) => {
+    try {
+        const [users] = await promiseDb.query(
+            "SELECT id, nom_complet FROM utilisateurs ORDER BY nom_complet"
+        );
+        res.json(users);
+    } catch (err) {
+        console.error("❌ Erreur récupération utilisateurs:", err);
+        res.status(500).json({ message: "Erreur lors de la récupération des utilisateurs" });
+    }
+});
+
+
+// GET - Récupérer la liste des utilisateurs pour le filtre
+app.get("/statistics/users", authenticateToken, async (req, res) => {
+    try {
+        const [users] = await promiseDb.query(
+            "SELECT id, nom_complet FROM utilisateurs ORDER BY nom_complet"
+        );
+        res.json(users);
+    } catch (err) {
+        console.error("❌ Erreur récupération utilisateurs:", err);
+        res.status(500).json({ message: "Erreur lors de la récupération des utilisateurs" });
+    }
+});
+
+// GET - Récupérer les soumissions de l'utilisateur avec filtres et tri
+app.get("/statistics/submissions",authenticateToken, async (req, res) => {
+    try {
+        const userId = req.user.id;
+        const page = parseInt(req.query.page) || 1;
+        const limit = parseInt(req.query.limit) || 20;
+        const offset = (page - 1) * limit;
+        const sortBy = req.query.sortBy || 'created_at';
+        const sortOrder = req.query.sortOrder || 'desc';
+        
+        // Récupérer les filtres
+        const { region, structure, typeActivite, dateDebut, dateFin } = req.query;
+
+        // Construire la requête SQL avec filtres
+        let query = 'SELECT SQL_CALC_FOUND_ROWS * FROM statistics_submissions WHERE user_id = ?';
+        const queryParams = [userId];
+
+        if (region) {
+            query += ' AND region = ?';
+            queryParams.push(region);
+        }
+
+        if (structure) {
+            query += ' AND structure = ?';
+            queryParams.push(structure);
+        }
+
+        if (typeActivite) {
+            query += ' AND type_activite = ?';
+            queryParams.push(typeActivite);
+        }
+
+        if (dateDebut) {
+            query += ' AND date_activite >= ?';
+            queryParams.push(dateDebut);
+        }
+
+        if (dateFin) {
+            query += ' AND date_activite <= ?';
+            queryParams.push(dateFin);
+        }
+
+        // Ajouter le tri
+        const validSortFields = ['created_at', 'region', 'structure', 'type_activite', 'date_activite', 'lieu_activite'];
+        const sortField = validSortFields.includes(sortBy) ? sortBy : 'created_at';
+        const order = sortOrder === 'asc' ? 'ASC' : 'DESC';
+        
+        query += ` ORDER BY ${sortField} ${order} LIMIT ? OFFSET ?`;
+        queryParams.push(limit, offset);
+
+        const [submissions] = await promiseDb.query(query, queryParams);
+        const [countResult] = await promiseDb.query("SELECT FOUND_ROWS() as total");
+
+        res.json({
+            submissions,
+            pagination: {
+                page,
+                limit,
+                total: countResult[0].total,
+                totalPages: Math.ceil(countResult[0].total / limit)
+            }
+        });
+
+    } catch (err) {
+        console.error("❌ Erreur récupération soumissions:", err);
+        res.status(500).json({ message: "Erreur lors de la récupération des soumissions" });
+    }
 });
 
 // GET - Récupérer une soumission spécifique
@@ -817,6 +949,8 @@ app.delete("/statistics/submissions/:id", authenticateToken, async (req, res) =>
     res.status(500).json({ message: "Erreur lors de la suppression" });
   }
 });
+
+
 
 
 // ============================================
