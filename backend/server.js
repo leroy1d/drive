@@ -8,6 +8,7 @@ const path = require("path");
 const fs = require("fs");
 const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
+const cloudinary = require('./cloudinary');
 
 const app = express();
 
@@ -22,11 +23,11 @@ app.use(bodyParser.urlencoded({ extended: true }));
 // ============================================
 // CONFIGURATION
 // ============================================
-const JWT_SECRET = process.env.JWT_SECRET || 'votre_clé_secrète_très_longue_et_aléatoire_123456789';
+const JWT_SECRET = 'votre_clé_secrète_très_longue_et_aléatoire_123456789';
 const SALT_ROUNDS = 10;
 
 // ============================================
-// CONNEXION MySQL avec POOL (pour Vercel)
+// CONNEXION MySQL avec POOL
 // ============================================
 const pool = mysql.createPool({
   host: "bcs5gda0htnrrrfyr38k-mysql.services.clever-cloud.com",
@@ -35,18 +36,14 @@ const pool = mysql.createPool({
   database: "bcs5gda0htnrrrfyr38k",
   port: 3306,
   waitForConnections: true,
-  connectionLimit: 10, // Limite réduite pour Vercel
+  connectionLimit: 5,
   queueLimit: 0,
   enableKeepAlive: true,
   keepAliveInitialDelay: 0,
   connectTimeout: 60000
 });
 
-// Promisify pour async/await
 const promisePool = pool.promise();
-
-// Garder une référence pour les requêtes callback
-const db = pool;
 
 // Tester la connexion au démarrage
 pool.getConnection((err, connection) => {
@@ -58,33 +55,12 @@ pool.getConnection((err, connection) => {
   }
 });
 
-// Gérer les erreurs de connexion
-pool.on('error', (err) => {
-  console.error('❌ Erreur pool MySQL:', err);
-  if (err.code === 'PROTOCOL_CONNECTION_LOST') {
-    console.log('🔄 Reconnexion...');
-  }
-});
-
-// Middleware pour vérifier la DB avant les requêtes importantes
-const ensureDbConnection = async (req, res, next) => {
-  try {
-    await promisePool.query('SELECT 1');
-    next();
-  } catch (err) {
-    console.error('❌ DB indisponible:', err);
-    res.status(503).json({ 
-      message: "Base de données temporairement indisponible. Veuillez réessayer." 
-    });
-  }
-};
-
 // ============================================
-// DOSSIER UPLOADS
+// DOSSIER TEMPORAIRE POUR UPLOADS
 // ============================================
-const uploadsDir = path.join(__dirname, "uploads");
-if (!fs.existsSync(uploadsDir)) {
-  fs.mkdirSync(uploadsDir, { recursive: true });
+const tempDir = path.join(__dirname, "temp");
+if (!fs.existsSync(tempDir)) {
+  fs.mkdirSync(tempDir, { recursive: true });
 }
 
 // ============================================
@@ -92,15 +68,19 @@ if (!fs.existsSync(uploadsDir)) {
 // ============================================
 const storage = multer.diskStorage({
   destination: function (req, file, cb) {
-    cb(null, "uploads/");
+    cb(null, "temp/");
   },
   filename: function (req, file, cb) {
     const ext = path.extname(file.originalname);
-    const name = file.originalname.replace(ext, "");
+    const name = file.originalname.replace(ext, "").replace(/[^a-zA-Z0-9]/g, '-');
     cb(null, name + "-" + Date.now() + ext);
   }
 });
-const upload = multer({ storage });
+
+const upload = multer({ 
+  storage,
+  limits: { fileSize: 50 * 1024 * 1024 }
+});
 
 // ============================================
 // MIDDLEWARE D'AUTHENTIFICATION
@@ -123,11 +103,8 @@ const authenticateToken = (req, res, next) => {
 };
 
 // ============================================
-// SERVEUR FICHIERS STATIQUES
+// ROUTES DE TEST
 // ============================================
-app.use("/uploads", express.static(path.join(__dirname, "uploads")));
-
-// Route de test
 app.get("/", (req, res) => {
   res.json({ 
     message: "API Drive Opened - Backend is running",
@@ -136,19 +113,21 @@ app.get("/", (req, res) => {
   });
 });
 
-// Route health check avec test DB
 app.get("/health", async (req, res) => {
   try {
     await promisePool.query('SELECT 1');
+    await cloudinary.api.ping();
     res.json({ 
       status: "OK", 
       database: "connected",
+      cloudinary: "connected",
       time: new Date().toISOString()
     });
   } catch (err) {
     res.json({ 
       status: "Degraded", 
-      database: "disconnected",
+      database: err.message.includes('SELECT') ? "disconnected" : "connected",
+      cloudinary: err.message.includes('cloudinary') ? "disconnected" : "connected",
       error: err.message,
       time: new Date().toISOString()
     });
@@ -159,37 +138,25 @@ app.get("/health", async (req, res) => {
 // ROUTES D'AUTHENTIFICATION
 // ============================================
 
-// 1. INSCRIPTION
+// INSCRIPTION
 app.post("/auth/register", async (req, res) => {
   const { nom_complet, email, password, pays, telephone, division, activite_id } = req.body;
   
   if (!nom_complet || !email || !password || !pays || !telephone || !division) {
-    return res.status(400).json({ 
-      message: "Tous les champs obligatoires doivent être remplis" 
-    });
+    return res.status(400).json({ message: "Tous les champs obligatoires doivent être remplis" });
   }
 
   if (password.length < 6) {
-    return res.status(400).json({ 
-      message: "Le mot de passe doit contenir au moins 6 caractères" 
-    });
+    return res.status(400).json({ message: "Le mot de passe doit contenir au moins 6 caractères" });
   }
 
   try {
-    const [existingUser] = await promisePool.query(
-      "SELECT id FROM utilisateurs WHERE email = ?", 
-      [email]
-    );
-
+    const [existingUser] = await promisePool.query("SELECT id FROM utilisateurs WHERE email = ?", [email]);
     if (existingUser.length > 0) {
       return res.status(400).json({ message: "Cet email est déjà utilisé" });
     }
 
-    const [existingPhone] = await promisePool.query(
-      "SELECT id FROM utilisateurs WHERE telephone = ?", 
-      [telephone]
-    );
-
+    const [existingPhone] = await promisePool.query("SELECT id FROM utilisateurs WHERE telephone = ?", [telephone]);
     if (existingPhone.length > 0) {
       return res.status(400).json({ message: "Ce numéro de téléphone est déjà utilisé" });
     }
@@ -197,19 +164,13 @@ app.post("/auth/register", async (req, res) => {
     const hashedPassword = await bcrypt.hash(password, SALT_ROUNDS);
 
     const [result] = await promisePool.query(
-      `INSERT INTO utilisateurs 
-       (nom_complet, email, password, pays, telephone, division, activite_id, accept_conditions) 
+      `INSERT INTO utilisateurs (nom_complet, email, password, pays, telephone, division, activite_id, accept_conditions) 
        VALUES (?, ?, ?, ?, ?, ?, ?, 1)`,
       [nom_complet, email, hashedPassword, pays, telephone, division, activite_id || null]
     );
 
     const token = jwt.sign(
-      { 
-        id: result.insertId, 
-        email, 
-        nom_complet,
-        division 
-      }, 
+      { id: result.insertId, email, nom_complet, division }, 
       JWT_SECRET, 
       { expiresIn: '24h' }
     );
@@ -231,21 +192,16 @@ app.post("/auth/register", async (req, res) => {
   }
 });
 
-// 2. CONNEXION
+// CONNEXION
 app.post("/auth/login", async (req, res) => {
   const { email, password } = req.body;
 
   if (!email || !password) {
-    return res.status(400).json({ 
-      message: "Email et mot de passe requis" 
-    });
+    return res.status(400).json({ message: "Email et mot de passe requis" });
   }
 
   try {
-    const [users] = await promisePool.query(
-      "SELECT * FROM utilisateurs WHERE email = ?", 
-      [email]
-    );
+    const [users] = await promisePool.query("SELECT * FROM utilisateurs WHERE email = ?", [email]);
 
     if (users.length === 0) {
       return res.status(401).json({ message: "Email ou mot de passe incorrect" });
@@ -261,12 +217,7 @@ app.post("/auth/login", async (req, res) => {
     delete user.password;
 
     const token = jwt.sign(
-      { 
-        id: user.id, 
-        email: user.email, 
-        nom_complet: user.nom_complet,
-        division: user.division 
-      }, 
+      { id: user.id, email: user.email, nom_complet: user.nom_complet, division: user.division }, 
       JWT_SECRET, 
       { expiresIn: '24h' }
     );
@@ -283,28 +234,22 @@ app.post("/auth/login", async (req, res) => {
   }
 });
 
-// 3. RAFRAÎCHIR LE TOKEN
+// RAFRAÎCHIR LE TOKEN
 app.post("/auth/refresh", authenticateToken, (req, res) => {
   const token = jwt.sign(
-    { 
-      id: req.user.id, 
-      email: req.user.email, 
-      nom_complet: req.user.nom_complet,
-      division: req.user.division 
-    }, 
+    { id: req.user.id, email: req.user.email, nom_complet: req.user.nom_complet, division: req.user.division }, 
     JWT_SECRET, 
     { expiresIn: '24h' }
   );
-
   res.json({ token });
 });
 
-// 4. DÉCONNEXION
+// DÉCONNEXION
 app.post("/auth/logout", (req, res) => {
   res.json({ message: "Déconnexion réussie" });
 });
 
-// 5. PROFIL UTILISATEUR
+// PROFIL UTILISATEUR
 app.get("/auth/profile", authenticateToken, async (req, res) => {
   try {
     const [users] = await promisePool.query(
@@ -323,7 +268,7 @@ app.get("/auth/profile", authenticateToken, async (req, res) => {
   }
 });
 
-// 6. VÉRIFIER LE TOKEN
+// VÉRIFIER LE TOKEN
 app.get("/auth/verify", authenticateToken, (req, res) => {
   res.json({ 
     valid: true, 
@@ -337,10 +282,10 @@ app.get("/auth/verify", authenticateToken, (req, res) => {
 });
 
 // ============================================
-// ROUTES PROTÉGÉES - DOSSIERS
+// ROUTES DOSSIERS
 // ============================================
 
-// GET - Récupérer tous les dossiers de l'utilisateur
+// GET - Récupérer tous les dossiers
 app.get("/folders", authenticateToken, async (req, res) => {
   try {
     const [results] = await promisePool.query(
@@ -350,7 +295,7 @@ app.get("/folders", authenticateToken, async (req, res) => {
     res.json(results);
   } catch (err) {
     console.error("❌ Erreur GET /folders:", err);
-    res.status(500).json({ message: "Erreur serveur lors de la récupération des dossiers" });
+    res.status(500).json({ message: "Erreur serveur" });
   }
 });
 
@@ -391,16 +336,15 @@ app.put("/folders/:id", authenticateToken, async (req, res) => {
     res.json({ id: parseInt(id), name, message: "Dossier renommé avec succès" });
   } catch (err) {
     console.error("❌ Erreur PUT /folders:", err);
-    res.status(500).json({ message: "Erreur lors du renommage du dossier" });
+    res.status(500).json({ message: "Erreur lors du renommage" });
   }
 });
 
-// DELETE - Supprimer un dossier
+// DELETE - Supprimer un dossier (avec Cloudinary)
 app.delete("/folders/:id", authenticateToken, async (req, res) => {
   const { id } = req.params;
   
   try {
-    // Récupérer le nom du dossier parent
     const [folderResults] = await promisePool.query(
       "SELECT name FROM folders WHERE id = ? AND (user_id = ? OR user_id IS NULL)", 
       [id, req.user.id]
@@ -412,9 +356,8 @@ app.delete("/folders/:id", authenticateToken, async (req, res) => {
     
     const folderName = folderResults[0].name;
     
-    // Récupérer tous les sous-dossiers
     const [allFolders] = await promisePool.query(
-      "SELECT id, name FROM folders WHERE (name = ? OR name LIKE ?) AND (user_id = ? OR user_id IS NULL)", 
+      "SELECT id FROM folders WHERE (name = ? OR name LIKE ?) AND (user_id = ? OR user_id IS NULL)", 
       [folderName, `${folderName}/%`, req.user.id]
     );
     
@@ -424,53 +367,44 @@ app.delete("/folders/:id", authenticateToken, async (req, res) => {
       return res.status(404).json({ message: "Aucun dossier à supprimer" });
     }
     
-    // Récupérer les fichiers
     const [fileResults] = await promisePool.query(
-      "SELECT url FROM files WHERE folder_id IN (?)", 
+      "SELECT cloudinary_id FROM files WHERE folder_id IN (?)", 
       [folderIds]
     );
     
-    // Supprimer les fichiers physiquement
-    let filesDeleted = 0;
-    fileResults.forEach(file => {
-      if (file.url) {
-        const filename = path.basename(file.url);
-        const filePath = path.join(__dirname, "uploads", filename);
-        if (fs.existsSync(filePath)) {
-          try {
-            fs.unlinkSync(filePath);
-            filesDeleted++;
-          } catch (unlinkErr) {
-            console.error(`Erreur suppression fichier ${filename}:`, unlinkErr);
-          }
+    let cloudinaryDeleted = 0;
+    for (const file of fileResults) {
+      if (file.cloudinary_id) {
+        try {
+          await cloudinary.uploader.destroy(file.cloudinary_id);
+          cloudinaryDeleted++;
+        } catch (cloudinaryErr) {
+          console.error(`❌ Erreur suppression Cloudinary:`, cloudinaryErr);
         }
       }
-    });
+    }
     
-    // Supprimer les fichiers de la base
     await promisePool.query("DELETE FROM files WHERE folder_id IN (?)", [folderIds]);
-    
-    // Supprimer les dossiers
     const [result] = await promisePool.query("DELETE FROM folders WHERE id IN (?)", [folderIds]);
     
     res.json({ 
       message: "Dossier et son contenu supprimés avec succès",
       foldersDeleted: result.affectedRows,
-      filesDeleted
+      cloudinaryDeleted
     });
 
   } catch (err) {
     console.error("❌ Erreur DELETE /folders:", err);
-    res.status(500).json({ message: "Erreur lors de la suppression des dossiers" });
+    res.status(500).json({ message: "Erreur lors de la suppression" });
   }
 });
 
 // ============================================
-// ROUTES PROTÉGÉES - FICHIERS
+// ROUTES FICHIERS (avec Cloudinary)
 // ============================================
 
-// GET - Récupérer tous les fichiers de l'utilisateur
-app.get("/files",authenticateToken,async (req, res) => {
+// GET - Récupérer tous les fichiers
+app.get("/files", authenticateToken, async (req, res) => {
   try {
     const [results] = await promisePool.query(
       `SELECT f.* FROM files f 
@@ -481,11 +415,11 @@ app.get("/files",authenticateToken,async (req, res) => {
     res.json(results);
   } catch (err) {
     console.error("❌ Erreur GET /files:", err);
-    res.status(500).json({ message: "Erreur serveur lors de la récupération des fichiers" });
+    res.status(500).json({ message: "Erreur serveur" });
   }
 });
 
-// POST - Upload fichier
+// POST - Upload fichier vers Cloudinary
 app.post("/upload", authenticateToken, upload.single("file"), async (req, res) => {
   const { folder_id } = req.body;
   
@@ -494,40 +428,50 @@ app.post("/upload", authenticateToken, upload.single("file"), async (req, res) =
   }
 
   if (!folder_id) {
+    if (req.file && req.file.path) fs.unlinkSync(req.file.path);
     return res.status(400).json({ message: "ID du dossier manquant" });
   }
 
   try {
-    // Vérifier que le dossier appartient à l'utilisateur
     const [folderCheck] = await promisePool.query(
       "SELECT id FROM folders WHERE id = ? AND (user_id = ? OR user_id IS NULL)",
       [folder_id, req.user.id]
     );
 
     if (folderCheck.length === 0) {
+      if (req.file && req.file.path) fs.unlinkSync(req.file.path);
       return res.status(403).json({ message: "Dossier non trouvé ou non autorisé" });
     }
 
-    const fileUrl = `https://drive-cyan-five.vercel.app/uploads/${req.file.filename}`;
-    const fileName = req.file.originalname;
-    const fileSize = req.file.size;
+    const result = await cloudinary.uploader.upload(req.file.path, {
+      folder: "drive-files",
+      resource_type: "auto",
+      public_id: `${Date.now()}-${req.file.originalname.replace(/\.[^/.]+$/, "").replace(/[^a-zA-Z0-9]/g, '-')}`,
+      tags: [`user-${req.user.id}`, `folder-${folder_id}`]
+    });
 
-    const [result] = await promisePool.query(
-      "INSERT INTO files (name, folder_id, url, size, created_at) VALUES (?, ?, ?, ?, NOW())",
-      [fileName, folder_id, fileUrl, fileSize]
+    if (req.file && req.file.path) fs.unlinkSync(req.file.path);
+
+    const [dbResult] = await promisePool.query(
+      "INSERT INTO files (name, folder_id, url, cloudinary_url, cloudinary_id, size, created_at) VALUES (?, ?, ?, ?, ?, ?, NOW())",
+      [req.file.originalname, folder_id, result.secure_url, result.secure_url, result.public_id, req.file.size]
     );
 
     res.json({ 
-      id: result.insertId, 
-      name: fileName, 
+      id: dbResult.insertId, 
+      name: req.file.originalname, 
       folder_id: parseInt(folder_id), 
-      url: fileUrl, 
-      size: fileSize,
+      url: result.secure_url,
+      cloudinary_id: result.public_id,
+      size: req.file.size,
       created_at: new Date().toISOString()
     });
 
   } catch (err) {
     console.error("❌ Erreur POST /upload:", err);
+    if (req.file && req.file.path && fs.existsSync(req.file.path)) {
+      try { fs.unlinkSync(req.file.path); } catch (e) {}
+    }
     res.status(500).json({ message: "Erreur lors de l'enregistrement du fichier" });
   }
 });
@@ -537,7 +481,6 @@ app.delete("/files/:id", authenticateToken, async (req, res) => {
   const { id } = req.params;
 
   try {
-    // Vérifier que le fichier appartient à l'utilisateur
     const [fileCheck] = await promisePool.query(
       `SELECT f.* FROM files f 
        JOIN folders fol ON f.folder_id = fol.id 
@@ -551,18 +494,15 @@ app.delete("/files/:id", authenticateToken, async (req, res) => {
 
     const file = fileCheck[0];
 
-    // Supprimer de la base
-    await promisePool.query("DELETE FROM files WHERE id = ?", [id]);
-
-    // Supprimer le fichier physique
-    if (file.url) {
-      const filename = path.basename(file.url);
-      const filePath = path.join(__dirname, "uploads", filename);
-      
-      if (fs.existsSync(filePath)) {
-        fs.unlinkSync(filePath);
+    if (file.cloudinary_id) {
+      try {
+        await cloudinary.uploader.destroy(file.cloudinary_id);
+      } catch (cloudinaryErr) {
+        console.error("❌ Erreur suppression Cloudinary:", cloudinaryErr);
       }
     }
+
+    await promisePool.query("DELETE FROM files WHERE id = ?", [id]);
 
     res.json({ message: "Fichier supprimé avec succès" });
 
@@ -580,7 +520,6 @@ app.put("/files/:id", authenticateToken, async (req, res) => {
   if (!name) return res.status(400).json({ message: "Nouveau nom requis" });
   
   try {
-    // Vérifier que le fichier appartient à l'utilisateur
     const [fileCheck] = await promisePool.query(
       `SELECT f.* FROM files f 
        JOIN folders fol ON f.folder_id = fol.id 
@@ -592,16 +531,13 @@ app.put("/files/:id", authenticateToken, async (req, res) => {
       return res.status(404).json({ message: "Fichier non trouvé ou non autorisé" });
     }
 
-    await promisePool.query(
-      "UPDATE files SET name = ? WHERE id = ?", 
-      [name, id]
-    );
+    await promisePool.query("UPDATE files SET name = ? WHERE id = ?", [name, id]);
 
     res.json({ id: parseInt(id), name, message: "Fichier renommé avec succès" });
 
   } catch (err) {
     console.error("❌ Erreur PUT /files:", err);
-    res.status(500).json({ message: "Erreur lors du renommage du fichier" });
+    res.status(500).json({ message: "Erreur lors du renommage" });
   }
 });
 
@@ -613,7 +549,6 @@ app.get("/files/folder/:folderId", authenticateToken, async (req, res) => {
   const offset = (page - 1) * limit;
   
   try {
-    // Vérifier que le dossier appartient à l'utilisateur
     const [folderCheck] = await promisePool.query(
       "SELECT id FROM folders WHERE id = ? AND (user_id = ? OR user_id IS NULL)",
       [folderId, req.user.id]
@@ -656,7 +591,6 @@ app.post("/statistics/submit", authenticateToken, async (req, res) => {
     const formData = req.body;
     const userId = req.user.id;
 
-    // Validation des données requises
     const requiredFields = [
       'region', 'structure', 'nomPrenoms', 'telephone', 'fonction',
       'documentValide', 'libelleActivite', 'typeActivite',
@@ -669,7 +603,6 @@ app.post("/statistics/submit", authenticateToken, async (req, res) => {
       }
     }
 
-    // Vérifier que le dossier appartient à l'utilisateur (si folderId est fourni)
     if (formData.folderId) {
       const [folderCheck] = await promisePool.query(
         "SELECT id FROM folders WHERE id = ? AND (user_id = ? OR user_id IS NULL)",
@@ -681,7 +614,6 @@ app.post("/statistics/submit", authenticateToken, async (req, res) => {
       }
     }
 
-    // Insertion dans la base de données
     const [result] = await promisePool.query(
       `INSERT INTO statistics_submissions (
         user_id, folder_id, folder_path, region, structure, autre_structure, 
@@ -719,7 +651,7 @@ app.post("/statistics/submit", authenticateToken, async (req, res) => {
 
   } catch (err) {
     console.error("❌ Erreur soumission formulaire:", err);
-    res.status(500).json({ message: "Erreur lors de la soumission du formulaire" });
+    res.status(500).json({ message: "Erreur lors de la soumission" });
   }
 });
 
@@ -790,7 +722,7 @@ app.get("/statistics/submissions/all", authenticateToken, async (req, res) => {
   }
 });
 
-// GET - Récupérer la liste des utilisateurs pour le filtre
+// GET - Récupérer la liste des utilisateurs
 app.get("/statistics/users", authenticateToken, async (req, res) => {
   try {
     const [users] = await promisePool.query(
@@ -803,7 +735,7 @@ app.get("/statistics/users", authenticateToken, async (req, res) => {
   }
 });
 
-// GET - Récupérer les soumissions de l'utilisateur avec filtres
+// GET - Récupérer les soumissions de l'utilisateur
 app.get("/statistics/submissions", authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
@@ -876,8 +808,7 @@ app.get("/statistics/submissions/:id", authenticateToken, async (req, res) => {
     const userId = req.user.id;
 
     const [submissions] = await promisePool.query(
-      `SELECT * FROM statistics_submissions 
-       WHERE id = ? AND user_id = ?`,
+      `SELECT * FROM statistics_submissions WHERE id = ? AND user_id = ?`,
       [submissionId, userId]
     );
 
@@ -926,14 +857,23 @@ app.delete("/statistics/submissions/:id", authenticateToken, async (req, res) =>
 });
 
 // ============================================
-// POUR VERCEL - EXPORTER L'APP
+// MIGRATION DE LA TABLE FILES
+// ============================================
+app.get("/migrate/files-table", async (req, res) => {
+  try {
+    await promisePool.query(`
+      ALTER TABLE files 
+      ADD COLUMN IF NOT EXISTS cloudinary_url VARCHAR(500),
+      ADD COLUMN IF NOT EXISTS cloudinary_id VARCHAR(200)
+    `);
+    res.json({ message: "Table files mise à jour avec succès" });
+  } catch (err) {
+    console.error("❌ Erreur migration:", err);
+    res.status(500).json({ message: "Erreur lors de la migration" });
+  }
+});
+
+// ============================================
+// POUR VERCEL
 // ============================================
 module.exports = app;
-
-// Pour le développement local uniquement
-// if (require.main === module) {
-//   const PORT = 3002;
-//   app.listen(PORT, () => {
-//     console.log(`🚀 Serveur démarré sur http://localhost:${PORT}`);
-//   });
-// }
