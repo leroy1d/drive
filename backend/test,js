@@ -11,7 +11,7 @@ const jwt = require("jsonwebtoken");
 
 const app = express();
 
-// Configuration CORS
+// Configuration CORS plus permissive pour les tests
 app.use(cors({
   origin: '*',
   credentials: true
@@ -26,58 +26,26 @@ const JWT_SECRET = process.env.JWT_SECRET || 'votre_clé_secrète_très_longue_e
 const SALT_ROUNDS = 10;
 
 // ============================================
-// CONNEXION MySQL avec POOL (pour Vercel)
+// CONNEXION MySQL
 // ============================================
-const pool = mysql.createPool({
+const db = mysql.createConnection({
   host: "bcs5gda0htnrrrfyr38k-mysql.services.clever-cloud.com",
   user: "unefpxhycbw35vpw",
   password: "skeSCz7C9RJzGNDZko1k",
   database: "bcs5gda0htnrrrfyr38k",
-  port: 3306,
-  waitForConnections: true,
-  connectionLimit: 10, // Limite réduite pour Vercel
-  queueLimit: 0,
-  enableKeepAlive: true,
-  keepAliveInitialDelay: 0,
-  connectTimeout: 60000
+  port: 3306
 });
 
-// Promisify pour async/await
-const promisePool = pool.promise();
-
-// Garder une référence pour les requêtes callback
-const db = pool;
-
-// Tester la connexion au démarrage
-pool.getConnection((err, connection) => {
+db.connect(err => {
   if (err) {
-    console.error("❌ Erreur initiale connexion MySQL:", err);
+    console.error("❌ Erreur connexion MySQL:", err);
   } else {
-    console.log("✅ Pool MySQL prêt - Connecté à la base de données");
-    connection.release();
+    console.log("✅ Connecté à MySQL (drive)");
   }
 });
 
-// Gérer les erreurs de connexion
-pool.on('error', (err) => {
-  console.error('❌ Erreur pool MySQL:', err);
-  if (err.code === 'PROTOCOL_CONNECTION_LOST') {
-    console.log('🔄 Reconnexion...');
-  }
-});
-
-// Middleware pour vérifier la DB avant les requêtes importantes
-const ensureDbConnection = async (req, res, next) => {
-  try {
-    await promisePool.query('SELECT 1');
-    next();
-  } catch (err) {
-    console.error('❌ DB indisponible:', err);
-    res.status(503).json({ 
-      message: "Base de données temporairement indisponible. Veuillez réessayer." 
-    });
-  }
-};
+// Promisify db queries
+const promiseDb = db.promise();
 
 // ============================================
 // DOSSIER UPLOADS
@@ -127,32 +95,18 @@ const authenticateToken = (req, res, next) => {
 // ============================================
 app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 
-// Route de test
+// Route de test pour vérifier que l'API fonctionne
 app.get("/", (req, res) => {
-  res.json({ 
-    message: "API Drive Opened - Backend is running",
-    status: "OK",
-    time: new Date().toISOString()
-  });
+  res.json({ message: "API Drive Opened - Backend is running" });
 });
 
-// Route health check avec test DB
-app.get("/health", async (req, res) => {
-  try {
-    await promisePool.query('SELECT 1');
-    res.json({ 
-      status: "OK", 
-      database: "connected",
-      time: new Date().toISOString()
-    });
-  } catch (err) {
-    res.json({ 
-      status: "Degraded", 
-      database: "disconnected",
-      error: err.message,
-      time: new Date().toISOString()
-    });
-  }
+// Route pour vérifier l'état de santé
+app.get("/health", (req, res) => {
+  res.json({ 
+    status: "OK", 
+    time: new Date().toISOString(),
+    database: db.state === 'authenticated' ? 'connected' : 'disconnected'
+  });
 });
 
 // ============================================
@@ -176,7 +130,7 @@ app.post("/auth/register", async (req, res) => {
   }
 
   try {
-    const [existingUser] = await promisePool.query(
+    const [existingUser] = await promiseDb.query(
       "SELECT id FROM utilisateurs WHERE email = ?", 
       [email]
     );
@@ -185,7 +139,7 @@ app.post("/auth/register", async (req, res) => {
       return res.status(400).json({ message: "Cet email est déjà utilisé" });
     }
 
-    const [existingPhone] = await promisePool.query(
+    const [existingPhone] = await promiseDb.query(
       "SELECT id FROM utilisateurs WHERE telephone = ?", 
       [telephone]
     );
@@ -196,7 +150,7 @@ app.post("/auth/register", async (req, res) => {
 
     const hashedPassword = await bcrypt.hash(password, SALT_ROUNDS);
 
-    const [result] = await promisePool.query(
+    const [result] = await promiseDb.query(
       `INSERT INTO utilisateurs 
        (nom_complet, email, password, pays, telephone, division, activite_id, accept_conditions) 
        VALUES (?, ?, ?, ?, ?, ?, ?, 1)`,
@@ -214,7 +168,7 @@ app.post("/auth/register", async (req, res) => {
       { expiresIn: '24h' }
     );
 
-    const [newUser] = await promisePool.query(
+    const [newUser] = await promiseDb.query(
       "SELECT id, nom_complet, email, pays, telephone, division, activite_id, created_at FROM utilisateurs WHERE id = ?",
       [result.insertId]
     );
@@ -242,7 +196,7 @@ app.post("/auth/login", async (req, res) => {
   }
 
   try {
-    const [users] = await promisePool.query(
+    const [users] = await promiseDb.query(
       "SELECT * FROM utilisateurs WHERE email = ?", 
       [email]
     );
@@ -283,31 +237,10 @@ app.post("/auth/login", async (req, res) => {
   }
 });
 
-// 3. RAFRAÎCHIR LE TOKEN
-app.post("/auth/refresh", authenticateToken, (req, res) => {
-  const token = jwt.sign(
-    { 
-      id: req.user.id, 
-      email: req.user.email, 
-      nom_complet: req.user.nom_complet,
-      division: req.user.division 
-    }, 
-    JWT_SECRET, 
-    { expiresIn: '24h' }
-  );
-
-  res.json({ token });
-});
-
-// 4. DÉCONNEXION
-app.post("/auth/logout", (req, res) => {
-  res.json({ message: "Déconnexion réussie" });
-});
-
-// 5. PROFIL UTILISATEUR
+// 3. PROFIL UTILISATEUR
 app.get("/auth/profile", authenticateToken, async (req, res) => {
   try {
-    const [users] = await promisePool.query(
+    const [users] = await promiseDb.query(
       "SELECT id, nom_complet, email, pays, telephone, division, activite_id, created_at FROM utilisateurs WHERE id = ?",
       [req.user.id]
     );
@@ -323,7 +256,7 @@ app.get("/auth/profile", authenticateToken, async (req, res) => {
   }
 });
 
-// 6. VÉRIFIER LE TOKEN
+// 4. VÉRIFIER LE TOKEN
 app.get("/auth/verify", authenticateToken, (req, res) => {
   res.json({ 
     valid: true, 
@@ -340,149 +273,156 @@ app.get("/auth/verify", authenticateToken, (req, res) => {
 // ROUTES PROTÉGÉES - DOSSIERS
 // ============================================
 
-// GET - Récupérer tous les dossiers de l'utilisateur
-app.get("/folders", authenticateToken, async (req, res) => {
-  try {
-    const [results] = await promisePool.query(
-      "SELECT * FROM folders WHERE user_id = ? OR user_id IS NULL", 
-      [req.user.id]
-    );
-    res.json(results);
-  } catch (err) {
-    console.error("❌ Erreur GET /folders:", err);
-    res.status(500).json({ message: "Erreur serveur lors de la récupération des dossiers" });
-  }
+// GET - Récupérer tous les dossiers
+app.get("/folders", authenticateToken, (req, res) => {
+  db.query(
+    "SELECT * FROM folders WHERE user_id = ? OR user_id IS NULL", 
+    [req.user.id], 
+    (err, results) => {
+      if (err) {
+        console.error("❌ Erreur GET /folders:", err);
+        return res.status(500).json({ message: "Erreur serveur" });
+      }
+      res.json(results);
+    }
+  );
 });
 
 // POST - Créer un nouveau dossier
-app.post("/folders", authenticateToken, async (req, res) => {
+app.post("/folders", authenticateToken, (req, res) => {
   const { name } = req.body;
   if (!name) return res.status(400).json({ message: "Nom du dossier requis" });
   
-  try {
-    const [result] = await promisePool.query(
-      "INSERT INTO folders (name, user_id) VALUES (?, ?)", 
-      [name, req.user.id]
-    );
-    res.json({ id: result.insertId, name, user_id: req.user.id });
-  } catch (err) {
-    console.error("❌ Erreur POST /folders:", err);
-    res.status(500).json({ message: "Erreur lors de la création du dossier" });
-  }
+  db.query(
+    "INSERT INTO folders (name, user_id) VALUES (?, ?)", 
+    [name, req.user.id], 
+    (err, result) => {
+      if (err) {
+        console.error("❌ Erreur POST /folders:", err);
+        return res.status(500).json({ message: "Erreur lors de la création" });
+      }
+      res.json({ id: result.insertId, name, user_id: req.user.id });
+    }
+  );
 });
 
 // PUT - Renommer un dossier
-app.put("/folders/:id", authenticateToken, async (req, res) => {
+app.put("/folders/:id", authenticateToken, (req, res) => {
   const { id } = req.params;
   const { name } = req.body;
   
   if (!name) return res.status(400).json({ message: "Nouveau nom requis" });
   
-  try {
-    const [result] = await promisePool.query(
-      "UPDATE folders SET name = ? WHERE id = ? AND (user_id = ? OR user_id IS NULL)", 
-      [name, id, req.user.id]
-    );
-    
-    if (result.affectedRows === 0) {
-      return res.status(404).json({ message: "Dossier non trouvé ou non autorisé" });
+  db.query(
+    "UPDATE folders SET name = ? WHERE id = ? AND (user_id = ? OR user_id IS NULL)", 
+    [name, id, req.user.id], 
+    (err, result) => {
+      if (err) {
+        console.error("❌ Erreur PUT /folders:", err);
+        return res.status(500).json({ message: "Erreur lors du renommage" });
+      }
+      if (result.affectedRows === 0) return res.status(404).json({ message: "Dossier non trouvé" });
+      res.json({ id: parseInt(id), name, message: "Renommé avec succès" });
     }
-    
-    res.json({ id: parseInt(id), name, message: "Dossier renommé avec succès" });
-  } catch (err) {
-    console.error("❌ Erreur PUT /folders:", err);
-    res.status(500).json({ message: "Erreur lors du renommage du dossier" });
-  }
+  );
 });
 
 // DELETE - Supprimer un dossier
-app.delete("/folders/:id", authenticateToken, async (req, res) => {
+app.delete("/folders/:id", authenticateToken, (req, res) => {
   const { id } = req.params;
   
-  try {
-    // Récupérer le nom du dossier parent
-    const [folderResults] = await promisePool.query(
-      "SELECT name FROM folders WHERE id = ? AND (user_id = ? OR user_id IS NULL)", 
-      [id, req.user.id]
-    );
-    
-    if (folderResults.length === 0) {
-      return res.status(404).json({ message: "Dossier non trouvé ou non autorisé" });
-    }
-    
-    const folderName = folderResults[0].name;
-    
-    // Récupérer tous les sous-dossiers
-    const [allFolders] = await promisePool.query(
-      "SELECT id, name FROM folders WHERE (name = ? OR name LIKE ?) AND (user_id = ? OR user_id IS NULL)", 
-      [folderName, `${folderName}/%`, req.user.id]
-    );
-    
-    const folderIds = allFolders.map(f => f.id);
-    
-    if (folderIds.length === 0) {
-      return res.status(404).json({ message: "Aucun dossier à supprimer" });
-    }
-    
-    // Récupérer les fichiers
-    const [fileResults] = await promisePool.query(
-      "SELECT url FROM files WHERE folder_id IN (?)", 
-      [folderIds]
-    );
-    
-    // Supprimer les fichiers physiquement
-    let filesDeleted = 0;
-    fileResults.forEach(file => {
-      if (file.url) {
-        const filename = path.basename(file.url);
-        const filePath = path.join(__dirname, "uploads", filename);
-        if (fs.existsSync(filePath)) {
-          try {
-            fs.unlinkSync(filePath);
-            filesDeleted++;
-          } catch (unlinkErr) {
-            console.error(`Erreur suppression fichier ${filename}:`, unlinkErr);
-          }
-        }
+  db.query(
+    "SELECT name FROM folders WHERE id = ? AND (user_id = ? OR user_id IS NULL)", 
+    [id, req.user.id], 
+    (err, folderResults) => {
+      if (err) {
+        return res.status(500).json({ message: "Erreur lors de la récupération" });
       }
-    });
-    
-    // Supprimer les fichiers de la base
-    await promisePool.query("DELETE FROM files WHERE folder_id IN (?)", [folderIds]);
-    
-    // Supprimer les dossiers
-    const [result] = await promisePool.query("DELETE FROM folders WHERE id IN (?)", [folderIds]);
-    
-    res.json({ 
-      message: "Dossier et son contenu supprimés avec succès",
-      foldersDeleted: result.affectedRows,
-      filesDeleted
-    });
-
-  } catch (err) {
-    console.error("❌ Erreur DELETE /folders:", err);
-    res.status(500).json({ message: "Erreur lors de la suppression des dossiers" });
-  }
+      
+      if (folderResults.length === 0) {
+        return res.status(404).json({ message: "Dossier non trouvé" });
+      }
+      
+      const folderName = folderResults[0].name;
+      
+      db.query(
+        "SELECT id, name FROM folders WHERE (name = ? OR name LIKE ?) AND (user_id = ? OR user_id IS NULL)", 
+        [folderName, `${folderName}/%`, req.user.id], 
+        (err, allFolders) => {
+          if (err) {
+            return res.status(500).json({ message: "Erreur lors de la récupération" });
+          }
+          
+          const folderIds = allFolders.map(f => f.id);
+          
+          if (folderIds.length === 0) {
+            return res.status(404).json({ message: "Aucun dossier à supprimer" });
+          }
+          
+          db.query("SELECT url FROM files WHERE folder_id IN (?)", [folderIds], (err, fileResults) => {
+            if (err) {
+              return res.status(500).json({ message: "Erreur lors de la récupération des fichiers" });
+            }
+            
+            let filesDeleted = 0;
+            fileResults.forEach(file => {
+              if (file.url) {
+                const filename = path.basename(file.url);
+                const filePath = path.join(__dirname, "uploads", filename);
+                if (fs.existsSync(filePath)) {
+                  try {
+                    fs.unlinkSync(filePath);
+                    filesDeleted++;
+                  } catch (unlinkErr) {
+                    console.error(`Erreur suppression fichier ${filename}:`, unlinkErr);
+                  }
+                }
+              }
+            });
+            
+            db.query("DELETE FROM files WHERE folder_id IN (?)", [folderIds], (err) => {
+              if (err) {
+                return res.status(500).json({ message: "Erreur lors de la suppression" });
+              }
+              
+              db.query("DELETE FROM folders WHERE id IN (?)", [folderIds], (err, result) => {
+                if (err) {
+                  return res.status(500).json({ message: "Erreur lors de la suppression" });
+                }
+                
+                res.json({ 
+                  message: "Dossier supprimé avec succès",
+                  foldersDeleted: result.affectedRows,
+                  filesDeleted
+                });
+              });
+            });
+          });
+        }
+      );
+    }
+  );
 });
 
 // ============================================
 // ROUTES PROTÉGÉES - FICHIERS
 // ============================================
 
-// GET - Récupérer tous les fichiers de l'utilisateur
-app.get("/files",authenticateToken,async (req, res) => {
-  try {
-    const [results] = await promisePool.query(
-      `SELECT f.* FROM files f 
-       JOIN folders fol ON f.folder_id = fol.id 
-       WHERE fol.user_id = ? OR fol.user_id IS NULL`,
-      [req.user.id]
-    );
-    res.json(results);
-  } catch (err) {
-    console.error("❌ Erreur GET /files:", err);
-    res.status(500).json({ message: "Erreur serveur lors de la récupération des fichiers" });
-  }
+// GET - Récupérer tous les fichiers
+app.get("/files", authenticateToken, (req, res) => {
+  db.query(
+    `SELECT f.* FROM files f 
+     JOIN folders fol ON f.folder_id = fol.id 
+     WHERE fol.user_id = ? OR fol.user_id IS NULL`,
+    [req.user.id], 
+    (err, results) => {
+      if (err) {
+        console.error("❌ Erreur GET /files:", err);
+        return res.status(500).json({ message: "Erreur serveur" });
+      }
+      res.json(results);
+    }
+  );
 });
 
 // POST - Upload fichier
@@ -498,37 +438,40 @@ app.post("/upload", authenticateToken, upload.single("file"), async (req, res) =
   }
 
   try {
-    // Vérifier que le dossier appartient à l'utilisateur
-    const [folderCheck] = await promisePool.query(
+    const [folderCheck] = await promiseDb.query(
       "SELECT id FROM folders WHERE id = ? AND (user_id = ? OR user_id IS NULL)",
       [folder_id, req.user.id]
     );
 
     if (folderCheck.length === 0) {
-      return res.status(403).json({ message: "Dossier non trouvé ou non autorisé" });
+      return res.status(403).json({ message: "Dossier non autorisé" });
     }
 
     const fileUrl = `https://drive-cyan-five.vercel.app/uploads/${req.file.filename}`;
     const fileName = req.file.originalname;
     const fileSize = req.file.size;
 
-    const [result] = await promisePool.query(
+    db.query(
       "INSERT INTO files (name, folder_id, url, size, created_at) VALUES (?, ?, ?, ?, NOW())",
-      [fileName, folder_id, fileUrl, fileSize]
+      [fileName, folder_id, fileUrl, fileSize],
+      (err, result) => {
+        if (err) {
+          console.error("❌ Erreur POST /upload:", err);
+          return res.status(500).json({ message: "Erreur lors de l'enregistrement" });
+        }
+        res.json({ 
+          id: result.insertId, 
+          name: fileName, 
+          folder_id: parseInt(folder_id), 
+          url: fileUrl, 
+          size: fileSize,
+          created_at: new Date().toISOString()
+        });
+      }
     );
-
-    res.json({ 
-      id: result.insertId, 
-      name: fileName, 
-      folder_id: parseInt(folder_id), 
-      url: fileUrl, 
-      size: fileSize,
-      created_at: new Date().toISOString()
-    });
-
   } catch (err) {
-    console.error("❌ Erreur POST /upload:", err);
-    res.status(500).json({ message: "Erreur lors de l'enregistrement du fichier" });
+    console.error("❌ Erreur upload:", err);
+    res.status(500).json({ message: "Erreur serveur" });
   }
 });
 
@@ -537,8 +480,7 @@ app.delete("/files/:id", authenticateToken, async (req, res) => {
   const { id } = req.params;
 
   try {
-    // Vérifier que le fichier appartient à l'utilisateur
-    const [fileCheck] = await promisePool.query(
+    const [fileCheck] = await promiseDb.query(
       `SELECT f.* FROM files f 
        JOIN folders fol ON f.folder_id = fol.id 
        WHERE f.id = ? AND (fol.user_id = ? OR fol.user_id IS NULL)`,
@@ -546,19 +488,15 @@ app.delete("/files/:id", authenticateToken, async (req, res) => {
     );
 
     if (fileCheck.length === 0) {
-      return res.status(404).json({ message: "Fichier non trouvé ou non autorisé" });
+      return res.status(404).json({ message: "Fichier non trouvé" });
     }
 
     const file = fileCheck[0];
+    await promiseDb.query("DELETE FROM files WHERE id = ?", [id]);
 
-    // Supprimer de la base
-    await promisePool.query("DELETE FROM files WHERE id = ?", [id]);
-
-    // Supprimer le fichier physique
     if (file.url) {
       const filename = path.basename(file.url);
       const filePath = path.join(__dirname, "uploads", filename);
-      
       if (fs.existsSync(filePath)) {
         fs.unlinkSync(filePath);
       }
@@ -567,8 +505,8 @@ app.delete("/files/:id", authenticateToken, async (req, res) => {
     res.json({ message: "Fichier supprimé avec succès" });
 
   } catch (err) {
-    console.error("❌ Erreur lors de la suppression:", err);
-    res.status(500).json({ message: "Erreur lors de la suppression du fichier" });
+    console.error("❌ Erreur suppression:", err);
+    res.status(500).json({ message: "Erreur lors de la suppression" });
   }
 });
 
@@ -580,8 +518,7 @@ app.put("/files/:id", authenticateToken, async (req, res) => {
   if (!name) return res.status(400).json({ message: "Nouveau nom requis" });
   
   try {
-    // Vérifier que le fichier appartient à l'utilisateur
-    const [fileCheck] = await promisePool.query(
+    const [fileCheck] = await promiseDb.query(
       `SELECT f.* FROM files f 
        JOIN folders fol ON f.folder_id = fol.id 
        WHERE f.id = ? AND (fol.user_id = ? OR fol.user_id IS NULL)`,
@@ -589,60 +526,15 @@ app.put("/files/:id", authenticateToken, async (req, res) => {
     );
 
     if (fileCheck.length === 0) {
-      return res.status(404).json({ message: "Fichier non trouvé ou non autorisé" });
+      return res.status(404).json({ message: "Fichier non trouvé" });
     }
 
-    await promisePool.query(
-      "UPDATE files SET name = ? WHERE id = ?", 
-      [name, id]
-    );
-
-    res.json({ id: parseInt(id), name, message: "Fichier renommé avec succès" });
+    await promiseDb.query("UPDATE files SET name = ? WHERE id = ?", [name, id]);
+    res.json({ id: parseInt(id), name, message: "Renommé avec succès" });
 
   } catch (err) {
     console.error("❌ Erreur PUT /files:", err);
-    res.status(500).json({ message: "Erreur lors du renommage du fichier" });
-  }
-});
-
-// GET - Fichiers par dossier avec pagination
-app.get("/files/folder/:folderId", authenticateToken, async (req, res) => {
-  const { folderId } = req.params;
-  const page = parseInt(req.query.page) || 1;
-  const limit = parseInt(req.query.limit) || 50;
-  const offset = (page - 1) * limit;
-  
-  try {
-    // Vérifier que le dossier appartient à l'utilisateur
-    const [folderCheck] = await promisePool.query(
-      "SELECT id FROM folders WHERE id = ? AND (user_id = ? OR user_id IS NULL)",
-      [folderId, req.user.id]
-    );
-
-    if (folderCheck.length === 0) {
-      return res.status(404).json({ message: "Dossier non trouvé ou non autorisé" });
-    }
-
-    const [files] = await promisePool.query(
-      "SELECT SQL_CALC_FOUND_ROWS * FROM files WHERE folder_id = ? ORDER BY created_at DESC LIMIT ? OFFSET ?",
-      [folderId, limit, offset]
-    );
-
-    const [countResult] = await promisePool.query("SELECT FOUND_ROWS() as total");
-    
-    res.json({
-      files,
-      pagination: {
-        page,
-        limit,
-        total: countResult[0].total,
-        totalPages: Math.ceil(countResult[0].total / limit)
-      }
-    });
-
-  } catch (err) {
-    console.error("❌ Erreur GET /files/folder/:folderId:", err);
-    res.status(500).json({ message: "Erreur serveur" });
+    res.status(500).json({ message: "Erreur lors du renommage" });
   }
 });
 
@@ -656,7 +548,6 @@ app.post("/statistics/submit", authenticateToken, async (req, res) => {
     const formData = req.body;
     const userId = req.user.id;
 
-    // Validation des données requises
     const requiredFields = [
       'region', 'structure', 'nomPrenoms', 'telephone', 'fonction',
       'documentValide', 'libelleActivite', 'typeActivite',
@@ -669,20 +560,7 @@ app.post("/statistics/submit", authenticateToken, async (req, res) => {
       }
     }
 
-    // Vérifier que le dossier appartient à l'utilisateur (si folderId est fourni)
-    if (formData.folderId) {
-      const [folderCheck] = await promisePool.query(
-        "SELECT id FROM folders WHERE id = ? AND (user_id = ? OR user_id IS NULL)",
-        [formData.folderId, userId]
-      );
-
-      if (folderCheck.length === 0) {
-        return res.status(403).json({ message: "Dossier non trouvé ou non autorisé" });
-      }
-    }
-
-    // Insertion dans la base de données
-    const [result] = await promisePool.query(
+    const [result] = await promiseDb.query(
       `INSERT INTO statistics_submissions (
         user_id, folder_id, folder_path, region, structure, autre_structure, 
         nom_prenoms, telephone, fonction, document_valide, libelle_activite, 
@@ -719,11 +597,11 @@ app.post("/statistics/submit", authenticateToken, async (req, res) => {
 
   } catch (err) {
     console.error("❌ Erreur soumission formulaire:", err);
-    res.status(500).json({ message: "Erreur lors de la soumission du formulaire" });
+    res.status(500).json({ message: "Erreur lors de la soumission" });
   }
 });
 
-// GET - Récupérer TOUTES les soumissions
+// GET - Toutes les soumissions
 app.get("/statistics/submissions/all", authenticateToken, async (req, res) => {
   try {
     const page = parseInt(req.query.page) || 1;
@@ -771,8 +649,8 @@ app.get("/statistics/submissions/all", authenticateToken, async (req, res) => {
     query += ` ORDER BY s.${sortField} ${order} LIMIT ? OFFSET ?`;
     queryParams.push(limit, offset);
 
-    const [submissions] = await promisePool.query(query, queryParams);
-    const [countResult] = await promisePool.query("SELECT FOUND_ROWS() as total");
+    const [submissions] = await promiseDb.query(query, queryParams);
+    const [countResult] = await promiseDb.query("SELECT FOUND_ROWS() as total");
 
     res.json({
       submissions,
@@ -786,24 +664,24 @@ app.get("/statistics/submissions/all", authenticateToken, async (req, res) => {
 
   } catch (err) {
     console.error("❌ Erreur récupération soumissions:", err);
-    res.status(500).json({ message: "Erreur lors de la récupération des soumissions" });
+    res.status(500).json({ message: "Erreur lors de la récupération" });
   }
 });
 
-// GET - Récupérer la liste des utilisateurs pour le filtre
+// GET - Liste des utilisateurs
 app.get("/statistics/users", authenticateToken, async (req, res) => {
   try {
-    const [users] = await promisePool.query(
+    const [users] = await promiseDb.query(
       "SELECT id, nom_complet FROM utilisateurs ORDER BY nom_complet"
     );
     res.json(users);
   } catch (err) {
     console.error("❌ Erreur récupération utilisateurs:", err);
-    res.status(500).json({ message: "Erreur lors de la récupération des utilisateurs" });
+    res.status(500).json({ message: "Erreur lors de la récupération" });
   }
 });
 
-// GET - Récupérer les soumissions de l'utilisateur avec filtres
+// GET - Soumissions de l'utilisateur
 app.get("/statistics/submissions", authenticateToken, async (req, res) => {
   try {
     const userId = req.user.id;
@@ -850,8 +728,8 @@ app.get("/statistics/submissions", authenticateToken, async (req, res) => {
     query += ` ORDER BY ${sortField} ${order} LIMIT ? OFFSET ?`;
     queryParams.push(limit, offset);
 
-    const [submissions] = await promisePool.query(query, queryParams);
-    const [countResult] = await promisePool.query("SELECT FOUND_ROWS() as total");
+    const [submissions] = await promiseDb.query(query, queryParams);
+    const [countResult] = await promiseDb.query("SELECT FOUND_ROWS() as total");
 
     res.json({
       submissions,
@@ -865,17 +743,17 @@ app.get("/statistics/submissions", authenticateToken, async (req, res) => {
 
   } catch (err) {
     console.error("❌ Erreur récupération soumissions:", err);
-    res.status(500).json({ message: "Erreur lors de la récupération des soumissions" });
+    res.status(500).json({ message: "Erreur lors de la récupération" });
   }
 });
 
-// GET - Récupérer une soumission spécifique
+// GET - Une soumission spécifique
 app.get("/statistics/submissions/:id", authenticateToken, async (req, res) => {
   try {
     const submissionId = req.params.id;
     const userId = req.user.id;
 
-    const [submissions] = await promisePool.query(
+    const [submissions] = await promiseDb.query(
       `SELECT * FROM statistics_submissions 
        WHERE id = ? AND user_id = ?`,
       [submissionId, userId]
@@ -898,7 +776,7 @@ app.get("/statistics/submissions/:id", authenticateToken, async (req, res) => {
 
   } catch (err) {
     console.error("❌ Erreur récupération soumission:", err);
-    res.status(500).json({ message: "Erreur lors de la récupération de la soumission" });
+    res.status(500).json({ message: "Erreur lors de la récupération" });
   }
 });
 
@@ -908,7 +786,7 @@ app.delete("/statistics/submissions/:id", authenticateToken, async (req, res) =>
     const submissionId = req.params.id;
     const userId = req.user.id;
 
-    const [result] = await promisePool.query(
+    const [result] = await promiseDb.query(
       "DELETE FROM statistics_submissions WHERE id = ? AND user_id = ?",
       [submissionId, userId]
     );
